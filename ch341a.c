@@ -32,14 +32,14 @@
 
 struct libusb_device_handle *devHandle = NULL;
 struct sigaction saold;
-int force_stop = 0;
+bool volatile force_stop = false;
 
-void v_print(int mode, int len) ;
+void v_print(int mode, int len);
 
 /* SIGINT handler */
 void sig_int(int signo)
 {
-    force_stop = 1;
+    force_stop = true;
 }
 
 /* Configure CH341A, find the device and set the default interface. */
@@ -348,7 +348,7 @@ int32_t ch341EraseChip(void)
     out[0] = 0x04; // Write disable
     ret = ch341SpiStream(out, in, 1);
     if (ret < 0) return ret;
-    return 0;
+    return -1;
 }
 
 /* callback for bulk out async transfer */
@@ -395,6 +395,9 @@ int32_t ch341SpiRead(uint8_t *buf, uint32_t add, uint32_t len)
     bool fourbyte = (add + len) > (1 << 24);
 
     if (devHandle == NULL) return -1;
+
+    signal(SIGINT, sig_int);
+    
     /* what subtracted is: 1. first cs package, 2. leading command for every other packages,
      * 3. second package contains read flash command and 3 bytes address */
     const uint32_t max_payload = CH341_MAX_PACKET_LEN - CH341_PACKET_LENGTH
@@ -466,8 +469,8 @@ int32_t ch341SpiRead(uint8_t *buf, uint32_t add, uint32_t len)
         ch341SpiCs(out, false);
         ret = usbTransfer(__func__, BULK_WRITE_ENDPOINT, out, 3);
         if (ret < 0) break;
-        if (force_stop == 1) { // user hit ctrl+C
-            force_stop = 0;
+        if (force_stop == true) { // user hit ctrl+C
+            force_stop = false;
             if (len > 0)
                 fprintf(stderr, "User hit Ctrl+C, reading unfinished.\n");
             break;
@@ -478,7 +481,7 @@ int32_t ch341SpiRead(uint8_t *buf, uint32_t add, uint32_t len)
     v_print(2, 0);
     return ret;
 }
-
+int __cycles;
 #define WRITE_PAYLOAD_LENGTH 301 // 301 is the length of a page(256)'s data with protocol overhead
 /* write buffer(*buf) to SPI flash */
 int32_t ch341SpiWrite(uint8_t *buf, uint32_t add, uint32_t len)
@@ -497,14 +500,18 @@ int32_t ch341SpiWrite(uint8_t *buf, uint32_t add, uint32_t len)
     v_print(0, len); // verbose
 
     if (devHandle == NULL) return -1;
+    
+    signal(SIGINT, sig_int);
+    
     memset(out, 0xff, WRITE_PAYLOAD_LENGTH);
     xferBulkIn  = libusb_alloc_transfer(0);
     xferBulkOut = libusb_alloc_transfer(0);
 
     printf("Write started!\n");
     while (len > 0) {
+        printf("Writing %d\n", len);
         v_print(1, len);
-
+        fflush(stdout);
         out[0] = 0x06; // Write enable
         ret = ch341SpiStream(out, in, 1);
         ch341SpiCs(out, true);
@@ -530,6 +537,9 @@ int32_t ch341SpiWrite(uint8_t *buf, uint32_t add, uint32_t len)
                 if (((add + tmp) & 0xFF) == 0) // cross page boundary
                     break;
             }
+        }
+        if (tmp == 0){
+            fprintf(stderr, "Failed to get non-zero buffer size\n");
         }
         len -= tmp;
         add += tmp;
@@ -560,13 +570,16 @@ int32_t ch341SpiWrite(uint8_t *buf, uint32_t add, uint32_t len)
         if (ret < 0) break;
         out[0] = 0x04; // Write disable
         ret = ch341SpiStream(out, in, 1);
+        __cycles = 0;
         do {
             ret = ch341ReadStatus();
+            __cycles++;
+            if (__cycles == 256){printf("Hung status wait ret=%d\n", ret);}
             if (ret != 0)
                 libusb_handle_events_timeout(NULL, &tv);
-        } while(ret != 0);
-        if (force_stop == 1) { // user hit ctrl+C
-            force_stop = 0;
+        } while(ret != 0 && force_stop == false);
+        if (force_stop == true) { // user hit ctrl+C
+            force_stop = false;
             if (len > 0)
                 fprintf(stderr, "User hit Ctrl+C, writing unfinished.\n");
             break;
